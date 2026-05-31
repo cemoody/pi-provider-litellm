@@ -30,8 +30,9 @@ export interface ModelInfoEntry {
     cache_creation_input_token_cost?: number;
     max_input_tokens?: number;
     max_output_tokens?: number;
-    supports_reasoning?: boolean;
-    supports_vision?: boolean;
+    // LiteLLM may send these as explicit null when it can't determine support.
+    supports_reasoning?: boolean | null;
+    supports_vision?: boolean | null;
   };
 }
 
