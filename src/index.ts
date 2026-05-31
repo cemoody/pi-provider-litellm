@@ -6,7 +6,7 @@ import type { ExtensionAPI, ProviderModelConfig } from "@earendil-works/pi-codin
 import { AuthStorage, getAgentDir } from "@earendil-works/pi-coding-agent";
 import { fingerprint, readCache, writeCache } from "./cache.js";
 import { setupLiteLLMCostTracking } from "./cost.js";
-import { discoverModels, normalizeBaseUrl, shouldSuppressReasoningContent } from "./discover.js";
+import { anthropicBaseUrl, discoverModels, normalizeBaseUrl, shouldSuppressReasoningContent } from "./discover.js";
 import { getSessionIdFromFile } from "./litellm.js";
 import type { AuthFileEntry, CacheFile, DiscoveryOptions, DiscoveryResult, ResolvedCredentials } from "./types.js";
 
@@ -200,7 +200,16 @@ async function refreshLiteLLM(credentials: OAuthCredentials): Promise<OAuthCrede
 function modifyLiteLLMModels(models: Model<Api>[], cred: OAuthCredentials): Model<Api>[] {
   const baseUrl = (cred as { baseUrl?: string }).baseUrl;
   if (!baseUrl) return models;
-  return models.map((m) => (m.provider === PROVIDER_NAME ? { ...m, baseUrl: `${baseUrl}/v1` } : m));
+  const normalized = normalizeBaseUrl(baseUrl);
+  return models.map((m) => {
+    if (m.provider !== PROVIDER_NAME) return m;
+    // Anthropic-routed models speak the native /v1/messages API at <base>/anthropic;
+    // keep them there instead of rewriting to the OpenAI chat-completions /v1 base.
+    if (m.api === "anthropic-messages") {
+      return { ...m, baseUrl: anthropicBaseUrl(normalized) };
+    }
+    return { ...m, baseUrl: `${normalized}/v1` };
+  });
 }
 
 function prepareLiteLLMRequestPayload(
