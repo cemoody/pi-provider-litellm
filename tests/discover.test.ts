@@ -3,6 +3,8 @@ import {
   anthropicBaseUrl,
   buildCompat,
   discoverModels,
+  inferImageInput,
+  inferReasoning,
   isAdaptiveThinkingModel,
   isAnthropicModel,
   normalizeBaseUrl,
@@ -161,6 +163,32 @@ describe("isAdaptiveThinkingModel", () => {
   });
 });
 
+describe("inferImageInput / inferReasoning", () => {
+  it("honors an explicit positive report", () => {
+    expect(inferImageInput("openai/gpt-4o", true)).toEqual(["text", "image"]);
+    expect(inferReasoning("openai/o3", true)).toBe(true);
+  });
+
+  it("honors an explicit negative report even for Claude", () => {
+    expect(inferImageInput("anthropic/claude-opus-4-8", false)).toEqual(["text"]);
+    expect(inferReasoning("anthropic/claude-opus-4-8", false)).toBe(false);
+  });
+
+  it("infers image + reasoning for Claude when the proxy is silent (null/undefined)", () => {
+    for (const reported of [null, undefined] as const) {
+      expect(inferImageInput("claude-opus-4-8", reported)).toEqual(["text", "image"]);
+      expect(inferImageInput("anthropic/claude-sonnet-4-6", reported)).toEqual(["text", "image"]);
+      expect(inferReasoning("claude-haiku-4-5", reported)).toBe(true);
+    }
+  });
+
+  it("defaults non-Claude models to text-only / no-reasoning when the proxy is silent", () => {
+    expect(inferImageInput("openai/gpt-4o", null)).toEqual(["text"]);
+    expect(inferImageInput("some-random-model", undefined)).toEqual(["text"]);
+    expect(inferReasoning("openai/gpt-4o", null)).toBe(false);
+  });
+});
+
 describe("shouldSuppressReasoningContent", () => {
   it("suppresses separate reasoning streams for Kimi/Moonshot aliases", () => {
     expect(shouldSuppressReasoningContent("kimi-k2.6")).toBe(true);
@@ -246,6 +274,39 @@ describe("discoverModels via /model/info", () => {
     // Non-Anthropic models keep the provider-default openai-completions routing.
     expect(openai?.api).toBeUndefined();
     expect(openai?.baseUrl).toBeUndefined();
+  });
+
+  it("infers image+reasoning for Claude when /model/info reports null (real LiteLLM behavior)", async () => {
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
+      const url = input instanceof URL ? input.toString() : String(input);
+      if (url.endsWith("/model/info")) {
+        return jsonResponse(200, {
+          data: [
+            {
+              // This is what the live proxy returns for claude-opus-4-8:
+              // supports_vision/reasoning are explicitly null, not booleans.
+              model_name: "claude-opus-4-8",
+              model_info: {
+                mode: null,
+                supports_vision: null,
+                supports_reasoning: null,
+                max_input_tokens: 200000,
+                max_output_tokens: 16384,
+              },
+            },
+          ],
+        });
+      }
+      throw new Error(`unexpected URL: ${url}`);
+    });
+
+    const result = await discoverModels("https://litellm.example.com", "sk-test", {});
+    const claude = result.models.find((m) => m.id === "claude-opus-4-8");
+    // Without inference this would be input:["text"] and the model would never
+    // see pasted images ("image omitted: model does not support images").
+    expect(claude?.input).toEqual(["text", "image"]);
+    expect(claude?.reasoning).toBe(true);
+    expect(claude?.api).toBe("anthropic-messages");
   });
 });
 

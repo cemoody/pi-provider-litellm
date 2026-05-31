@@ -63,6 +63,33 @@ export function isAnthropicModel(modelId: string): boolean {
   return ANTHROPIC_MODEL_PATTERN.test(modelId);
 }
 
+// LiteLLM's /model/info frequently reports `supports_vision: null` and
+// `supports_reasoning: null` for proxied Claude models (the proxy simply
+// doesn't populate them). Taken literally that marks the model text-only,
+// and pi-ai's transform-messages then strips every image block, replacing it
+// with "(image omitted: model does not support images)" -- so the UI renders
+// the pasted image but the model never sees it. All modern Claude models are
+// vision- and reasoning-capable, so when the proxy is silent we infer support
+// from the model id rather than defaulting to text-only.
+export function inferImageInput(
+  modelId: string,
+  reported: boolean | null | undefined,
+): ("text" | "image")[] {
+  if (reported === true || (reported == null && isAnthropicModel(modelId))) {
+    return ["text", "image"];
+  }
+  return ["text"];
+}
+
+export function inferReasoning(
+  modelId: string,
+  reported: boolean | null | undefined,
+): boolean {
+  if (reported === true) return true;
+  if (reported == null && isAnthropicModel(modelId)) return true;
+  return false;
+}
+
 // Newer Claude models (Opus 4.6/4.7/4.8, Sonnet 4.6) only accept the
 // `thinking: { type: "adaptive" }` + `output_config.effort` shape; Opus 4.7/4.8
 // outright REJECT the legacy `thinking: { type: "enabled", budget_tokens }`
@@ -263,8 +290,8 @@ function mapFromModelInfo(entry: ModelInfoEntry): ProviderModelConfig | undefine
   return {
     id,
     name: id,
-    reasoning: info.supports_reasoning ?? false,
-    input: info.supports_vision ? ["text", "image"] : ["text"],
+    reasoning: inferReasoning(id, info.supports_reasoning),
+    input: inferImageInput(id, info.supports_vision),
     cost: {
       input: (info.input_cost_per_token ?? 0) * 1_000_000,
       output: (info.output_cost_per_token ?? 0) * 1_000_000,
