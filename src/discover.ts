@@ -59,6 +59,52 @@ export function shouldSuppressReasoningContent(modelId: string): boolean {
   return isMoonshotModel(modelId) && !FORCED_THINKING_MODEL_PATTERN.test(modelId);
 }
 
+export function isAnthropicModel(modelId: string): boolean {
+  return ANTHROPIC_MODEL_PATTERN.test(modelId);
+}
+
+// Newer Claude models (Opus 4.6/4.7/4.8, Sonnet 4.6) only accept the
+// `thinking: { type: "adaptive" }` + `output_config.effort` shape; Opus 4.7/4.8
+// outright REJECT the legacy `thinking: { type: "enabled", budget_tokens }`
+// format with a 400. pi-ai (>=0.76) keys this decision off
+// `compat.forceAdaptiveThinking`, so we set it for the adaptive-capable family.
+// Haiku 4.5 is deliberately excluded: it only supports the legacy `enabled`
+// format and REJECTS adaptive, so it must keep the default budget-based path.
+const ADAPTIVE_THINKING_MODEL_PATTERN =
+  /(?:^|[-_/.:])(?:opus[-_.]?4[-_.](?:6|7|8)|sonnet[-_.]?4[-_.]6)(?=$|[-_/.:])/i;
+
+export function isAdaptiveThinkingModel(modelId: string): boolean {
+  return ADAPTIVE_THINKING_MODEL_PATTERN.test(modelId);
+}
+
+// LiteLLM exposes an Anthropic-native passthrough at `<base>/anthropic` that
+// implements `/v1/messages`. Routing Claude models there lets pi speak the
+// native Anthropic API (image source blocks with explicit media_type) instead
+// of OpenAI chat-completions `image_url` data URIs, which LiteLLM must then
+// re-translate to Anthropic format -- a lossy hop that degrades image input.
+// Set LITELLM_ANTHROPIC_NATIVE=0 to disable and fall back to openai-completions.
+const ENV_ANTHROPIC_NATIVE = "LITELLM_ANTHROPIC_NATIVE";
+
+export function anthropicNativeEnabled(): boolean {
+  return process.env[ENV_ANTHROPIC_NATIVE] !== "0";
+}
+
+export function anthropicBaseUrl(normalizedBase: string): string {
+  return `${normalizedBase}/anthropic`;
+}
+
+// Apply native-Anthropic routing overrides in place for Claude-backed models.
+function applyAnthropicRouting(models: ProviderModelConfig[], normalizedBase: string): void {
+  if (!anthropicNativeEnabled()) return;
+  const anthropicBase = anthropicBaseUrl(normalizedBase);
+  for (const model of models) {
+    if (isAnthropicModel(model.id)) {
+      model.api = "anthropic-messages";
+      model.baseUrl = anthropicBase;
+    }
+  }
+}
+
 export function buildCompat(modelId: string): ProviderModelConfig["compat"] {
   if (isMoonshotModel(modelId)) {
     return {
@@ -70,7 +116,11 @@ export function buildCompat(modelId: string): ProviderModelConfig["compat"] {
     };
   }
   if (ANTHROPIC_MODEL_PATTERN.test(modelId)) {
-    return { supportsStore: false, cacheControlFormat: "anthropic" };
+    return {
+      supportsStore: false,
+      cacheControlFormat: "anthropic",
+      ...(isAdaptiveThinkingModel(modelId) ? { forceAdaptiveThinking: true } : {}),
+    };
   }
   return { supportsStore: false };
 }
@@ -259,6 +309,7 @@ export async function discoverModels(
     const models = (infoResult.data.data ?? [])
       .map(mapFromModelInfo)
       .filter((m): m is ProviderModelConfig => m !== undefined);
+    applyAnthropicRouting(models, base);
     return { source: "model_info", models };
   }
   if (![401, 403, 404].includes(infoResult.status)) {
@@ -272,5 +323,6 @@ export async function discoverModels(
   const models = (listResult.data.data ?? [])
     .map((entry) => mapFromModelsList(entry, modelsDev))
     .filter((m): m is ProviderModelConfig => m !== undefined);
+  applyAnthropicRouting(models, base);
   return { source: "models_list", models };
 }

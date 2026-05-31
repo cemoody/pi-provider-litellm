@@ -1,5 +1,13 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { buildCompat, discoverModels, normalizeBaseUrl, shouldSuppressReasoningContent } from "../src/discover.js";
+import {
+  anthropicBaseUrl,
+  buildCompat,
+  discoverModels,
+  isAdaptiveThinkingModel,
+  isAnthropicModel,
+  normalizeBaseUrl,
+  shouldSuppressReasoningContent,
+} from "../src/discover.js";
 
 function jsonResponse(status: number, body: unknown): Response {
   return new Response(JSON.stringify(body), {
@@ -69,7 +77,8 @@ describe("buildCompat", () => {
   });
 
   it("adds cacheControlFormat for bare Claude aliases", () => {
-    for (const id of ["claude-3-5-sonnet", "opus-4.7", "sonnet-4.6", "haiku-4.5"]) {
+    // Legacy / non-adaptive models keep budget-based thinking (no forceAdaptiveThinking).
+    for (const id of ["claude-3-5-sonnet", "haiku-4.5"]) {
       expect(buildCompat(id)).toEqual({
         supportsStore: false,
         cacheControlFormat: "anthropic",
@@ -77,10 +86,28 @@ describe("buildCompat", () => {
     }
   });
 
-  it("adds cacheControlFormat for routed Anthropic aliases", () => {
+  it("forces adaptive thinking for Opus 4.6/4.7/4.8 and Sonnet 4.6", () => {
+    for (const id of ["opus-4.6", "opus-4.7", "opus-4.8", "sonnet-4.6", "claude-opus-4-8"]) {
+      expect(buildCompat(id)).toEqual({
+        supportsStore: false,
+        cacheControlFormat: "anthropic",
+        forceAdaptiveThinking: true,
+      });
+    }
+  });
+
+  it("does NOT force adaptive thinking for Haiku 4.5 (it rejects adaptive)", () => {
+    expect(buildCompat("claude-haiku-4-5")).toEqual({
+      supportsStore: false,
+      cacheControlFormat: "anthropic",
+    });
+  });
+
+  it("adds cacheControlFormat + adaptive for routed Anthropic aliases", () => {
     expect(buildCompat("google/claude-sonnet-4-6")).toEqual({
       supportsStore: false,
       cacheControlFormat: "anthropic",
+      forceAdaptiveThinking: true,
     });
   });
 
@@ -93,11 +120,44 @@ describe("buildCompat", () => {
     expect(buildCompat("Opus-4.7")).toEqual({
       supportsStore: false,
       cacheControlFormat: "anthropic",
+      forceAdaptiveThinking: true,
     });
     expect(buildCompat("CLAUDE-3-5-SONNET")).toEqual({
       supportsStore: false,
       cacheControlFormat: "anthropic",
     });
+  });
+});
+
+describe("isAdaptiveThinkingModel", () => {
+  it("matches Opus 4.6/4.7/4.8 and Sonnet 4.6 across separators and prefixes", () => {
+    for (const id of [
+      "claude-opus-4-8",
+      "claude-opus-4-7",
+      "claude-opus-4-6",
+      "claude-sonnet-4-6",
+      "anthropic/claude-opus-4.8",
+      "opus-4-8",
+      "Opus-4.7",
+      "google/claude-sonnet-4-6",
+    ]) {
+      expect(isAdaptiveThinkingModel(id)).toBe(true);
+    }
+  });
+
+  it("does NOT match Haiku 4.5 (rejects adaptive) or older/unrelated models", () => {
+    for (const id of [
+      "claude-haiku-4-5",
+      "haiku-4.5",
+      "claude-opus-4-5",
+      "claude-sonnet-4-5",
+      "claude-opus-4-1",
+      "claude-3-5-sonnet",
+      "openai/gpt-4o",
+      "vendor/opusflow",
+    ]) {
+      expect(isAdaptiveThinkingModel(id)).toBe(false);
+    }
   });
 });
 
@@ -169,6 +229,10 @@ describe("discoverModels via /model/info", () => {
       maxTokens: 8192,
       input: ["text", "image"],
       compat: { supportsStore: false, cacheControlFormat: "anthropic" },
+      // Claude models route to LiteLLM's native Anthropic /v1/messages passthrough
+      // so image input is not lossily re-translated from openai-completions.
+      api: "anthropic-messages",
+      baseUrl: "https://litellm.example.com/anthropic",
     });
     // cost is per-token in LiteLLM, per-million-tokens in pi-ai
     expect(anthropic?.cost).toEqual({ input: 3, output: 15, cacheRead: 0.3, cacheWrite: 3.75 });
@@ -178,6 +242,56 @@ describe("discoverModels via /model/info", () => {
       id: "openai/gpt-4o",
       input: ["text"],
       compat: { supportsStore: false },
+    });
+    // Non-Anthropic models keep the provider-default openai-completions routing.
+    expect(openai?.api).toBeUndefined();
+    expect(openai?.baseUrl).toBeUndefined();
+  });
+});
+
+describe("anthropic native routing", () => {
+  const ENV_KEY = "LITELLM_ANTHROPIC_NATIVE";
+  const original = process.env[ENV_KEY];
+  afterEach(() => {
+    if (original === undefined) delete process.env[ENV_KEY];
+    else process.env[ENV_KEY] = original;
+  });
+
+  it("identifies Anthropic-backed model ids", () => {
+    expect(isAnthropicModel("claude-opus-4-8")).toBe(true);
+    expect(isAnthropicModel("anthropic/claude-3-5-sonnet")).toBe(true);
+    expect(isAnthropicModel("google/claude-sonnet-4-6")).toBe(true);
+    expect(isAnthropicModel("opus-4.7")).toBe(true);
+    expect(isAnthropicModel("openai/gpt-4o")).toBe(false);
+    expect(isAnthropicModel("gemini-2.5-pro")).toBe(false);
+  });
+
+  it("derives the native Anthropic passthrough base", () => {
+    expect(anthropicBaseUrl("https://litellm.example.com")).toBe("https://litellm.example.com/anthropic");
+  });
+
+  it("does not override routing when LITELLM_ANTHROPIC_NATIVE=0", async () => {
+    process.env[ENV_KEY] = "0";
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
+      const url = input instanceof URL ? input.toString() : String(input);
+      if (url.endsWith("/model/info")) {
+        return jsonResponse(200, {
+          data: [{ model_name: "claude-opus-4-8", model_info: { mode: "chat", supports_vision: true } }],
+        });
+      }
+      throw new Error(`unexpected URL: ${url}`);
+    });
+
+    const result = await discoverModels("https://litellm.example.com", "sk-test", {});
+    const claude = result.models.find((m) => m.id === "claude-opus-4-8");
+    expect(claude?.api).toBeUndefined();
+    expect(claude?.baseUrl).toBeUndefined();
+    // cache_control + adaptive-thinking compat are still applied regardless of the
+    // native-routing flag (they describe the model, not the transport).
+    expect(claude?.compat).toEqual({
+      supportsStore: false,
+      cacheControlFormat: "anthropic",
+      forceAdaptiveThinking: true,
     });
   });
 });
@@ -201,6 +315,9 @@ describe("discoverModels fallback to /v1/models", () => {
       const anthropic = result.models.find((m) => m.id === "anthropic/claude-3-5-sonnet")!;
       expect(anthropic.name).toBe("anthropic/claude-3-5-sonnet (no metadata)");
       expect(anthropic.compat).toEqual({ supportsStore: false, cacheControlFormat: "anthropic" });
+      // Native Anthropic routing is also applied on the /v1/models fallback path.
+      expect(anthropic.api).toBe("anthropic-messages");
+      expect(anthropic.baseUrl).toBe("https://litellm.example.com/anthropic");
     });
   }
 
